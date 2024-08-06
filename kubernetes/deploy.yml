@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: tracking-analysis-service
-          image: 'rannybal2024/tracking-analysis-service:latest'
+          image: 'rannybal2024/tracking-analysis-service:IMAGE_TAG'
           ports:
             - containerPort: 8091
               protocol: TCP
