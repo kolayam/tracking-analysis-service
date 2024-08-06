@@ -15,7 +15,6 @@ import org.springframework.context.annotation.ComponentScan;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.client.RestTemplate;
-
 import springfox.documentation.swagger2.annotations.EnableSwagger2;
 
 @EnableCaching
@@ -36,7 +35,7 @@ public class TrackingAnalysisApplication implements CommandLineRunner {
             throw new ExitException();
         }
     }
-    
+
     @Bean
     public RestTemplate restTemplate(RestTemplateBuilder builder) {
 

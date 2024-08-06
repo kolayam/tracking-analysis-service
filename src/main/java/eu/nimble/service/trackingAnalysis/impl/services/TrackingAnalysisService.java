@@ -1,16 +1,9 @@
 package eu.nimble.service.trackingAnalysis.impl.services;
 
-import java.io.IOException;
-import java.net.MalformedURLException;
-import java.net.URL;
-import java.text.MessageFormat;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
-import java.util.stream.Collectors;
-
-import org.json.JSONArray;
+import com.fasterxml.jackson.core.JsonParseException;
+import com.fasterxml.jackson.databind.JsonMappingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import eu.nimble.service.trackingAnalysis.impl.dao.*;
 import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,229 +11,206 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.client.RestTemplate;
 
-import com.fasterxml.jackson.core.JsonParseException;
-import com.fasterxml.jackson.databind.JsonMappingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
-
-import eu.nimble.service.trackingAnalysis.impl.dao.EPCISObjectEvent;
-import eu.nimble.service.trackingAnalysis.impl.dao.EPCTrackingMetaData;
-import eu.nimble.service.trackingAnalysis.impl.dao.ProductTrackingResult;
-import eu.nimble.service.trackingAnalysis.impl.dao.ProductionEndTimeEstimation;
-import eu.nimble.service.trackingAnalysis.impl.dao.ProductionProcessStep;
-import eu.nimble.service.trackingAnalysis.impl.dao.ProductionProcessTemplate;
-import org.springframework.http.HttpMethod;
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.List;
 
 /**
- * This service is used to get estimated duration of each production process step based on 
+ * This service is used to get estimated duration of each production process step based on
  * the analysis on the tracking records of history product items.
- * It assume that each product class has one production process template, and each product items belongs to the same product 
- * class has therefore the same production process template. 
+ * It assume that each product class has one production process template, and each product items belongs to the same product
+ * class has therefore the same production process template.
  * It runs on the NIMBLE platform and will call the T&T APIs that defined as interface between companies and the NIMBLE platform.
- * Definition of the T&T API can be found under: https://app.swaggerhub.com/apis/BIB1/NIMBLE_Tracking/0.0.2 
- * The T&T APIs should be implemented by companies and published to NIMBLE platform during product catalogue publishing. 
- *	
- *
- * For example, we have now an order with product EPC code "Product_1", which belongs to published product 
- * "Product_bathroom", and has the process template: enter-->production--->shipping--->Delivered. And according to the T 
- * & T Events, it is at Moment in the step "production", and we need to use T & T analysis service to calculate the 
+ * Definition of the T&T API can be found under: https://app.swaggerhub.com/apis/BIB1/NIMBLE_Tracking/0.0.2
+ * The T&T APIs should be implemented by companies and published to NIMBLE platform during product catalogue publishing.
+ * <p>
+ * <p>
+ * For example, we have now an order with product EPC code "Product_1", which belongs to published product
+ * "Product_bathroom", and has the process template: enter-->production--->shipping--->Delivered. And according to the T
+ * & T Events, it is at Moment in the step "production", and we need to use T & T analysis service to calculate the
  * duration from "production" to "shipping" , as well as to "Delivered".
- * 
- * In history orders in NIMBLE platform, there are an order with product "Product_bathroom" with EPC Code "Product_2",  
- * "Product_3", and another order with product "NIMBLE_BATH" with EPC Code "NIMBLE_MAGIC". In this case, NIMBLE platform 
- * know that the Code "Product_2",  "Product_3" belongs to the same product and share the same process template, but not 
- * "NIMBLE_MAGIC". So the NIMBLE platform i.e. your API send us the code "Product_2",  "Product_3" . We can then gather 
- * the T & T Events from "Product_2",  "Product_3" to have a calculation. For example, for code "Product_2", the step 
- * "production" has taken 1 day, and for code  "Product_3"  it has taken 3 days, then we can estimate that for the 
+ * <p>
+ * In history orders in NIMBLE platform, there are an order with product "Product_bathroom" with EPC Code "Product_2",
+ * "Product_3", and another order with product "NIMBLE_BATH" with EPC Code "NIMBLE_MAGIC". In this case, NIMBLE platform
+ * know that the Code "Product_2",  "Product_3" belongs to the same product and share the same process template, but not
+ * "NIMBLE_MAGIC". So the NIMBLE platform i.e. your API send us the code "Product_2",  "Product_3" . We can then gather
+ * the T & T Events from "Product_2",  "Product_3" to have a calculation. For example, for code "Product_2", the step
+ * "production" has taken 1 day, and for code  "Product_3"  it has taken 3 days, then we can estimate that for the
  * current code "Product_1", it can take around 2 days.
- * 
- * @author dqu
  *
+ * @author dqu
  */
 @Service
 public class TrackingAnalysisService {
 
     private static Logger log = LoggerFactory.getLogger(TrackingAnalysisService.class);
 
-	
+
     @Autowired
     private RestTemplate restTemplate;
-    
-    // Tracking service URL
-	@Value("${spring.tracking.url}")
-	private String trackingURL;
-	
-	/**
-	 * Estimate the end time of production process according to production process template for a given item
-	 * @param itemID EPC code for an item
-	 * @param procTemplateJson production process template json string
-	 * @param bearer bearer token in NIMBLE
-	 * @return ProductionEndTimeEstimation with UTC timestamp as production end time
-	 */
-    public ProductionEndTimeEstimation estimateProcEndTimeWithGivenDuration(String itemID,  String procTemplateJson, String bearer) {
-    	
-    	String FAILED_ESTIMATION_TIME = "0";
-    	String msg = "";
-    	ProductionEndTimeEstimation endTimeEst = new ProductionEndTimeEstimation();
-    	endTimeEst.setEpc(itemID);
-    	endTimeEst.setProductionEndTime(FAILED_ESTIMATION_TIME);
-    	endTimeEst.setMessage(msg);
-    	
-		// Current occurred step in the production process template
-		ProductionProcessStep curProcTemplateStep = null;
-		// Time of the last occurred event in the tracking record 
-		long lastOccurredObjEventTime;
-    	
-    	// Get Production Process Template
-    	ProductionProcessTemplate procTemplate = null;
-		try {
-			procTemplate = this.initProductionProcessTemplateWithJson(procTemplateJson);
-			
-			if(procTemplate.getSteps().isEmpty())
-			{
-				msg = "Empty production process template!";
-				log.error(msg);
-				
-				endTimeEst.setMessage(msg);
-				return endTimeEst;
-			}
-		} catch (Exception e) {
-			msg = "Fail to init production process template with the given JSON string!";
-			log.error(msg, e);
-			
-			endTimeEst.setMessage(msg);
-			return endTimeEst;
-		}
-		
-		// Get Tracking events
-    	HttpHeaders headers = new HttpHeaders();
-    	headers.add("Authorization", bearer);
-    	ProductTrackingResult trackingResult = this.getProductTrackingResult(itemID, headers);
-    
-    	
-    	// In case of no tracking records, we assume the production process will immediately start
-    	if(trackingResult.getEpcisObjEvents().isEmpty())
-    	{
-    		log.info("No tracking records for the item with EPC:" + itemID);
 
-    		// The current step is the first step, and it will immediately start
-    		curProcTemplateStep = procTemplate.getFirstStep();
-    		
-    		lastOccurredObjEventTime = System.currentTimeMillis();
-    	}
-    	else
-    	{
-    		EPCISObjectEvent lastOccuredObjEvent = trackingResult.getLastEvent();
-    		lastOccurredObjEventTime = lastOccuredObjEvent.getEventTime().getDate();
-    		
-        	ProductionProcessStep lastOccuredProcStep = trackingResult.getMatchedProcStepForEvent(lastOccuredObjEvent, procTemplate);
-        	if(lastOccuredProcStep == null)
-        	{
-        		msg = "Tracking history cannot match the given production process template! /n"
-        				+ "The last event in the tracking history does not match any step in the process template, epc:" + itemID;
-        		log.error(msg);
-        		
-    			endTimeEst.setMessage(msg);
-    			return endTimeEst;
-        	}
-        	
-        	curProcTemplateStep = lastOccuredProcStep;
-        	
-        	// When the next step should have already been started according to the duration in process template, but it has not yet started,
-        	// then we assume the next step will immediately start
-        	if(!lastOccuredProcStep.isFinalStep())
-        	{
-	        	long expectedNextStepStartTime = lastOccurredObjEventTime + lastOccuredProcStep.getDurationToNextInMS();
-	        	if(System.currentTimeMillis() > expectedNextStepStartTime)
-	        	{
-	        		lastOccurredObjEventTime = System.currentTimeMillis();
-	        		curProcTemplateStep = procTemplate.getNextStepOf(lastOccuredProcStep);
-	        	}
-        	}
-    	}
-    	
-    	// In case production process steps are finished
-    	if(curProcTemplateStep.isFinalStep())
-    	{
-        	endTimeEst.setProductionEndTime(Long.toString(lastOccurredObjEventTime));
-        	endTimeEst.setMessage("Production process is already finished!");
-        	return endTimeEst;
-    	}
-    	
-    	// Calculate estimated time
-    	ProductionProcessStep nextStep = curProcTemplateStep;
-    	long nextEventTime = lastOccurredObjEventTime;
-    	while(!nextStep.isFinalStep())
-    	{
-    		long stepDuration = nextStep.getDurationToNextInMS();
-    		if (stepDuration <0)
-    		{
-    			endTimeEst.setMessage("durationToNext or durationTimeUnit is not correctly specified in the production process template!");
-    			return endTimeEst;
-    		}
-    		
-    		nextEventTime = nextEventTime + stepDuration;
-    		nextStep = procTemplate.getNextStepOf(nextStep);
-    	}
-    	
-    	endTimeEst.setProductionEndTime(Long.toString(nextEventTime));
-    	endTimeEst.setMessage("Estimated production end time!");
-    	return endTimeEst;
+    // Tracking service URL
+    @Value("${spring.tracking.url}")
+    private String trackingURL;
+
+    /**
+     * Estimate the end time of production process according to production process template for a given item
+     *
+     * @param itemID           EPC code for an item
+     * @param procTemplateJson production process template json string
+     * @param bearer           bearer token in NIMBLE
+     * @return ProductionEndTimeEstimation with UTC timestamp as production end time
+     */
+    public ProductionEndTimeEstimation estimateProcEndTimeWithGivenDuration(String itemID, String procTemplateJson, String bearer) {
+
+        String FAILED_ESTIMATION_TIME = "0";
+        String msg = "";
+        ProductionEndTimeEstimation endTimeEst = new ProductionEndTimeEstimation();
+        endTimeEst.setEpc(itemID);
+        endTimeEst.setProductionEndTime(FAILED_ESTIMATION_TIME);
+        endTimeEst.setMessage(msg);
+
+        // Current occurred step in the production process template
+        ProductionProcessStep curProcTemplateStep = null;
+        // Time of the last occurred event in the tracking record
+        long lastOccurredObjEventTime;
+
+        // Get Production Process Template
+        ProductionProcessTemplate procTemplate = null;
+        try {
+            procTemplate = this.initProductionProcessTemplateWithJson(procTemplateJson);
+
+            if (procTemplate.getSteps().isEmpty()) {
+                msg = "Empty production process template!";
+                log.error(msg);
+
+                endTimeEst.setMessage(msg);
+                return endTimeEst;
+            }
+        } catch (Exception e) {
+            msg = "Fail to init production process template with the given JSON string!";
+            log.error(msg, e);
+
+            endTimeEst.setMessage(msg);
+            return endTimeEst;
+        }
+
+        // Get Tracking events
+        HttpHeaders headers = new HttpHeaders();
+        headers.add("Authorization", bearer);
+        ProductTrackingResult trackingResult = this.getProductTrackingResult(itemID, headers);
+
+
+        // In case of no tracking records, we assume the production process will immediately start
+        if (trackingResult.getEpcisObjEvents().isEmpty()) {
+            log.info("No tracking records for the item with EPC:" + itemID);
+
+            // The current step is the first step, and it will immediately start
+            curProcTemplateStep = procTemplate.getFirstStep();
+
+            lastOccurredObjEventTime = System.currentTimeMillis();
+        } else {
+            EPCISObjectEvent lastOccuredObjEvent = trackingResult.getLastEvent();
+            lastOccurredObjEventTime = lastOccuredObjEvent.getEventTime().getDate();
+
+            ProductionProcessStep lastOccuredProcStep = trackingResult.getMatchedProcStepForEvent(lastOccuredObjEvent, procTemplate);
+            if (lastOccuredProcStep == null) {
+                msg = "Tracking history cannot match the given production process template! /n"
+                        + "The last event in the tracking history does not match any step in the process template, epc:" + itemID;
+                log.error(msg);
+
+                endTimeEst.setMessage(msg);
+                return endTimeEst;
+            }
+
+            curProcTemplateStep = lastOccuredProcStep;
+
+            // When the next step should have already been started according to the duration in process template, but it has not yet started,
+            // then we assume the next step will immediately start
+            if (!lastOccuredProcStep.isFinalStep()) {
+                long expectedNextStepStartTime = lastOccurredObjEventTime + lastOccuredProcStep.getDurationToNextInMS();
+                if (System.currentTimeMillis() > expectedNextStepStartTime) {
+                    lastOccurredObjEventTime = System.currentTimeMillis();
+                    curProcTemplateStep = procTemplate.getNextStepOf(lastOccuredProcStep);
+                }
+            }
+        }
+
+        // In case production process steps are finished
+        if (curProcTemplateStep.isFinalStep()) {
+            endTimeEst.setProductionEndTime(Long.toString(lastOccurredObjEventTime));
+            endTimeEst.setMessage("Production process is already finished!");
+            return endTimeEst;
+        }
+
+        // Calculate estimated time
+        ProductionProcessStep nextStep = curProcTemplateStep;
+        long nextEventTime = lastOccurredObjEventTime;
+        while (!nextStep.isFinalStep()) {
+            long stepDuration = nextStep.getDurationToNextInMS();
+            if (stepDuration < 0) {
+                endTimeEst.setMessage("durationToNext or durationTimeUnit is not correctly specified in the production process template!");
+                return endTimeEst;
+            }
+
+            nextEventTime = nextEventTime + stepDuration;
+            nextStep = procTemplate.getNextStepOf(nextStep);
+        }
+
+        endTimeEst.setProductionEndTime(Long.toString(nextEventTime));
+        endTimeEst.setMessage("Estimated production end time!");
+        return endTimeEst;
     }
-    
-	
+
+
     /**
      * Get tracking events with the tracking API URL provided by company.
+     *
      * @param itemID
      * @return
      */
-    public ProductTrackingResult getProductTrackingResult(String itemID, HttpHeaders headers)
-    {
-    	ProductTrackingResult trackingRes = new ProductTrackingResult();
-        
-		String url = trackingURL.trim();
-		if(!url.endsWith("/"))
-		{
-			url = url + "/";
-		}
-		url = url + "simpleTracking/" + itemID;
+    public ProductTrackingResult getProductTrackingResult(String itemID, HttpHeaders headers) {
+        ProductTrackingResult trackingRes = new ProductTrackingResult();
+
+        String url = trackingURL.trim();
+        if (!url.endsWith("/")) {
+            url = url + "/";
+        }
+        url = url + "simpleTracking/" + itemID;
 
 
-		log.info("itemID:" + itemID);
-		log.info("URL:" + url);
+        log.info("itemID:" + itemID);
+        log.info("URL:" + url);
 
-	    HttpEntity<String> request = new HttpEntity<String>(headers);
-	   
-	    ResponseEntity<EPCISObjectEvent[]> response = restTemplate.exchange(url, HttpMethod.GET, request,EPCISObjectEvent[].class);
-		        
+        HttpEntity<String> request = new HttpEntity<String>(headers);
+
+        ResponseEntity<EPCISObjectEvent[]> response = restTemplate.exchange(url, HttpMethod.GET, request, EPCISObjectEvent[].class);
+
         List<EPCISObjectEvent> result = Arrays.asList(response.getBody());
         trackingRes.setEpcisObjEvents(result);
-        
+
         return trackingRes;
     }
-    
-    public ProductionProcessTemplate initProductionProcessTemplateWithJson(String procTemplateJson) throws JsonParseException, JsonMappingException, IOException
-    {
-    	JSONObject procTemplateObj = new JSONObject(procTemplateJson);
-    	String proStepsJsonArray = procTemplateObj.getJSONArray("productionProcessTemplate").toString();
-    	
-    	ObjectMapper mapper = new ObjectMapper();
-    	List<ProductionProcessStep> procStepList = Arrays.asList(mapper.readValue(proStepsJsonArray,  ProductionProcessStep[].class));
-    	
+
+    public ProductionProcessTemplate initProductionProcessTemplateWithJson(String procTemplateJson) throws JsonParseException, JsonMappingException, IOException {
+        JSONObject procTemplateObj = new JSONObject(procTemplateJson);
+        String proStepsJsonArray = procTemplateObj.getJSONArray("productionProcessTemplate").toString();
+
+        ObjectMapper mapper = new ObjectMapper();
+        List<ProductionProcessStep> procStepList = Arrays.asList(mapper.readValue(proStepsJsonArray, ProductionProcessStep[].class));
+
         ProductionProcessTemplate procTemplate = initProductionProcessTemplateWithSteps(procStepList);
-        
+
         return procTemplate;
     }
-    
-    public ProductionProcessTemplate initProductionProcessTemplateWithSteps(List<ProductionProcessStep> procStepList)
-    {
-    	ProductionProcessTemplate procTemplate = new ProductionProcessTemplate();
+
+    public ProductionProcessTemplate initProductionProcessTemplateWithSteps(List<ProductionProcessStep> procStepList) {
+        ProductionProcessTemplate procTemplate = new ProductionProcessTemplate();
         procTemplate.setSteps(procStepList);
 
         return procTemplate;
